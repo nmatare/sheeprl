@@ -588,6 +588,9 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
 
     test_step = 0
 
+    print("batch shape:", cfg.per_rank_sequence_length, cfg.per_rank_batch_size)
+    print("num updates", num_updates)
+
     per_rank_gradient_steps = 0
     for update in range(start_step, num_updates + 1):
         policy_step += cfg.env.num_envs * world_size
@@ -711,7 +714,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         updates_before_training -= 1
 
         # Train the agent
-        print("TIME UNTIL LEARNING: ", learning_starts - update, end="\r")
+        import time
+
         if update >= learning_starts and updates_before_training <= 0:
             local_data = rb.sample(
                 cfg.per_rank_batch_size,
@@ -728,6 +732,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                         for cp, tcp in zip(critic.module.parameters(), target_critic.parameters()):
                             tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
 
+                    now = time.time()
                     train(
                         fabric,
                         world_model,
@@ -744,6 +749,9 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                         actions_dim,
                         moments,
                     )
+
+                    print("train time: ", time.time() - now)
+                    print("step: ", update)
 
                     per_rank_gradient_steps += 1
                 train_step += world_size
