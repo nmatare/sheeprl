@@ -55,6 +55,7 @@ def reconstruction_loss(
             Default to False.
 
     Returns:
+
         observation_loss (Tensor): the value of the observation loss.
         KL divergence (Tensor): the KL divergence between the posterior and the prior.
         reward_loss (Tensor): the value of the reward loss.
@@ -62,10 +63,12 @@ def reconstruction_loss(
         continue_loss (Tensor): the value of the continue loss (0 if it is not computed).
         reconstruction_loss (Tensor): the value of the overall reconstruction loss.
     """
-    rewards.device
+    device = rewards.device
     observation_loss = -sum([po[k].log_prob(observations[k]) for k in po.keys()])
+
     reward_loss = -pr.log_prob(rewards)
     # KL balancing
+    kl_free_nats = torch.tensor([kl_free_nats], device=device)
     dyn_loss = kl = kl_divergence(
         Independent(
             OneHotCategoricalStraightThroughValidateArgs(
@@ -80,8 +83,7 @@ def reconstruction_loss(
             validate_args=validate_args,
         ),
     )
-    free_nats = torch.full_like(dyn_loss, kl_free_nats)
-    dyn_loss = kl_dynamic * torch.maximum(dyn_loss, free_nats)
+    dyn_loss = kl_dynamic * torch.maximum(dyn_loss, kl_free_nats)
     repr_loss = kl_divergence(
         Independent(
             OneHotCategoricalStraightThroughValidateArgs(logits=posteriors_logits, validate_args=validate_args),
@@ -94,12 +96,12 @@ def reconstruction_loss(
             validate_args=validate_args,
         ),
     )
-    repr_loss = kl_representation * torch.maximum(repr_loss, free_nats)
+    repr_loss = kl_representation * torch.maximum(repr_loss, kl_free_nats)
     kl_loss = dyn_loss + repr_loss
+    continue_loss = torch.tensor(0.0, device=device)
     if pc is not None and continue_targets is not None:
         continue_loss = continue_scale_factor * -pc.log_prob(continue_targets)
-    else:
-        continue_loss = torch.zeros_like(reward_loss)
+
     reconstruction_loss = (kl_regularizer * kl_loss + observation_loss + reward_loss + continue_loss).mean()
     return (
         reconstruction_loss,
@@ -108,4 +110,6 @@ def reconstruction_loss(
         reward_loss.mean(),
         observation_loss.mean(),
         continue_loss.mean(),
+        dyn_loss.mean(),
+        repr_loss.mean(),
     )

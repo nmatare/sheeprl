@@ -6,13 +6,12 @@ import hydra
 import torch
 from lightning.fabric import Fabric
 from lightning.fabric.wrappers import _FabricModule
-from lightning.pytorch.utilities.seed import isolate_rng
 from torch import nn
 
 from sheeprl.algos.dreamer_v2.agent import Actor as DV2Actor
 from sheeprl.algos.dreamer_v2.agent import MinedojoActor as DV2MinedojoActor
 from sheeprl.algos.dreamer_v2.agent import WorldModel
-from sheeprl.algos.dreamer_v2.agent import build_agent as dv2_build_agent
+from sheeprl.algos.dreamer_v2.agent import build_models as dv2_build_models
 from sheeprl.models.models import MLP
 from sheeprl.utils.utils import init_weights
 
@@ -23,21 +22,20 @@ Actor = DV2Actor
 MinedojoActor = DV2MinedojoActor
 
 
-def build_agent(
+def build_models(
     fabric: Fabric,
     actions_dim: Sequence[int],
     is_continuous: bool,
     cfg: Dict[str, Any],
     obs_space: gymnasium.spaces.Dict,
     world_model_state: Optional[Dict[str, torch.Tensor]] = None,
-    ensembles_state: Optional[Dict[str, torch.Tensor]] = None,
     actor_task_state: Optional[Dict[str, torch.Tensor]] = None,
     critic_task_state: Optional[Dict[str, torch.Tensor]] = None,
     target_critic_task_state: Optional[Dict[str, torch.Tensor]] = None,
     actor_exploration_state: Optional[Dict[str, torch.Tensor]] = None,
     critic_exploration_state: Optional[Dict[str, torch.Tensor]] = None,
     target_critic_exploration_state: Optional[Dict[str, torch.Tensor]] = None,
-) -> Tuple[WorldModel, _FabricModule, _FabricModule, _FabricModule, nn.Module, _FabricModule, _FabricModule, nn.Module]:
+) -> Tuple[WorldModel, _FabricModule, _FabricModule, nn.Module, _FabricModule, _FabricModule, nn.Module]:
     """Build the models and wrap them with Fabric.
 
     Args:
@@ -47,8 +45,6 @@ def build_agent(
         cfg (DictConfig): the configs of P2E_DV2.
         obs_space (Dict[str, Any]): The observations space of the environment.
         world_model_state (Dict[str, Tensor], optional): the state of the world model.
-            Default to None.
-        ensembles_state (Dict[str, Tensor], optional): the state of the ensembles.
             Default to None.
         actor_task_state (Dict[str, Tensor], optional): the state of the actor_task.
             Default to None.
@@ -65,14 +61,13 @@ def build_agent(
 
     Returns:
         The world model (WorldModel): composed by the encoder, rssm, observation and
-            reward models and the continue model.
-        The ensembles (_FabricModule): for estimating the intrinsic reward.
-        The actor_task (_FabricModule): for learning the task.
-        The critic_task (_FabricModule): for predicting the values of the task.
-        The target_critic_task (nn.Module): takes a EMA of the critic_task weights.
-        The actor_exploration (_FabricModule): for exploring the environment.
-        The critic_exploration (_FabricModule): for predicting the values of the exploration.
-        The target_critic_exploration (nn.Module): takes a EMA of the critic_exploration weights.
+        reward models and the continue model.
+        The actor_task (_FabricModule).
+        The critic_task (_FabricModule).
+        The target_critic_task (nn.Module).
+        The actor_exploration (_FabricModule).
+        The critic_exploration (_FabricModule).
+        The target_critic_exploration (nn.Module).
     """
     world_model_cfg = cfg.algo.world_model
     actor_cfg = cfg.algo.actor
@@ -83,7 +78,7 @@ def build_agent(
     latent_state_size = stochastic_size + world_model_cfg.recurrent_model.recurrent_state_size
 
     # Create exploration models
-    world_model, actor_exploration, critic_exploration, target_critic_exploration = dv2_build_agent(
+    world_model, actor_exploration, critic_exploration, target_critic_exploration = dv2_build_models(
         fabric,
         actions_dim=actions_dim,
         is_continuous=is_continuous,
@@ -136,46 +131,8 @@ def build_agent(
     if target_critic_task_state:
         target_critic_task.load_state_dict(target_critic_task_state)
 
-    # initialize the ensembles with different seeds to be sure they have different weights
-    ens_list = []
-    with isolate_rng():
-        for i in range(cfg.algo.ensembles.n):
-            fabric.seed_everything(cfg.seed + i)
-            ens_list.append(
-                MLP(
-                    input_dims=int(
-                        sum(actions_dim)
-                        + cfg.algo.world_model.recurrent_model.recurrent_state_size
-                        + cfg.algo.world_model.stochastic_size * cfg.algo.world_model.discrete_size
-                    ),
-                    output_dim=cfg.algo.world_model.stochastic_size * cfg.algo.world_model.discrete_size,
-                    hidden_sizes=[cfg.algo.ensembles.dense_units] * cfg.algo.ensembles.mlp_layers,
-                    activation=eval(cfg.algo.ensembles.dense_act),
-                    flatten_dim=None,
-                    norm_layer=(
-                        [nn.LayerNorm for _ in range(cfg.algo.ensembles.mlp_layers)]
-                        if cfg.algo.ensembles.layer_norm
-                        else None
-                    ),
-                    norm_args=(
-                        [
-                            {"normalized_shape": cfg.algo.ensembles.dense_units}
-                            for _ in range(cfg.algo.ensembles.mlp_layers)
-                        ]
-                        if cfg.algo.ensembles.layer_norm
-                        else None
-                    ),
-                ).apply(init_weights)
-            )
-    ensembles = nn.ModuleList(ens_list)
-    if ensembles_state:
-        ensembles.load_state_dict(ensembles_state)
-    for i in range(len(ensembles)):
-        ensembles[i] = fabric.setup_module(ensembles[i])
-
     return (
         world_model,
-        ensembles,
         actor_task,
         critic_task,
         target_critic_task,

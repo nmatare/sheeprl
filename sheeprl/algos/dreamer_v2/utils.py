@@ -1,8 +1,7 @@
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import gymnasium as gym
+import numpy as np
 import torch
 import torch.nn as nn
 from lightning import Fabric
@@ -11,12 +10,8 @@ from torch.distributions import Independent
 
 from sheeprl.utils.distribution import OneHotCategoricalStraightThroughValidateArgs
 from sheeprl.utils.env import make_env
-from sheeprl.utils.imports import _IS_MLFLOW_AVAILABLE
-from sheeprl.utils.utils import unwrap_fabric
 
 if TYPE_CHECKING:
-    from mlflow.models.model import ModelInfo
-
     from sheeprl.algos.dreamer_v1.agent import PlayerDV1
     from sheeprl.algos.dreamer_v2.agent import PlayerDV2
 
@@ -39,7 +34,6 @@ AGGREGATOR_KEYS = {
     "Grads/actor",
     "Grads/critic",
 }
-MODELS_TO_REGISTER = {"world_model", "actor", "critic", "target_critic"}
 
 
 def compute_stochastic_state(logits: Tensor, discrete: int = 32, sample=True, validate_args=False) -> Tensor:
@@ -139,9 +133,9 @@ def test(
         # Act greedly through the environment
         preprocessed_obs = {}
         for k, v in next_obs.items():
-            if k in cfg.algo.cnn_keys.encoder:
+            if k in cfg.cnn_keys.encoder:
                 preprocessed_obs[k] = v[None, ...].to(device) / 255 - 0.5
-            elif k in cfg.algo.mlp_keys.encoder:
+            elif k in cfg.mlp_keys.encoder:
                 preprocessed_obs[k] = v[None, ...].to(device)
         real_actions = player.get_greedy_action(
             preprocessed_obs, sample_actions, {k: v for k, v in preprocessed_obs.items() if k.startswith("mask")}
@@ -149,7 +143,7 @@ def test(
         if player.actor.is_continuous:
             real_actions = torch.cat(real_actions, -1).cpu().numpy()
         else:
-            real_actions = torch.cat([real_act.argmax(dim=-1) for real_act in real_actions], dim=-1).cpu().numpy()
+            real_actions = np.array([real_act.cpu().argmax(dim=-1).numpy() for real_act in real_actions])
 
         # Single environment step
         next_obs, reward, done, truncated, _ = env.step(real_actions.reshape(env.action_space.shape))
@@ -161,43 +155,3 @@ def test(
     if cfg.metric.log_level > 0 and len(fabric.loggers) > 0:
         fabric.logger.log_metrics({"Test/cumulative_reward": cumulative_rew}, 0)
     env.close()
-
-
-def log_models_from_checkpoint(
-    fabric: Fabric, env: gym.Env | gym.Wrapper, cfg: Dict[str, Any], state: Dict[str, Any]
-) -> Sequence["ModelInfo"]:
-    if not _IS_MLFLOW_AVAILABLE:
-        raise ModuleNotFoundError(str(_IS_MLFLOW_AVAILABLE))
-    import mlflow  # noqa
-
-    from sheeprl.algos.dreamer_v2.agent import build_agent
-
-    # Create the models
-    is_continuous = isinstance(env.action_space, gym.spaces.Box)
-    is_multidiscrete = isinstance(env.action_space, gym.spaces.MultiDiscrete)
-    actions_dim = tuple(
-        env.action_space.shape
-        if is_continuous
-        else (env.action_space.nvec.tolist() if is_multidiscrete else [env.action_space.n])
-    )
-    world_model, actor, critic, target_critic = build_agent(
-        fabric,
-        actions_dim,
-        is_continuous,
-        cfg,
-        env.observation_space,
-        state["world_model"],
-        state["actor"],
-        state["critic"],
-        state["target_critic"],
-    )
-
-    # Log the model, create a new run if `cfg.run_id` is None.
-    model_info = {}
-    with mlflow.start_run(run_id=cfg.run.id, experiment_id=cfg.experiment.id, run_name=cfg.run.name, nested=True) as _:
-        model_info["world_model"] = mlflow.pytorch.log_model(unwrap_fabric(world_model), artifact_path="world_model")
-        model_info["actor"] = mlflow.pytorch.log_model(unwrap_fabric(actor), artifact_path="actor")
-        model_info["critic"] = mlflow.pytorch.log_model(unwrap_fabric(critic), artifact_path="critic")
-        model_info["target_critic"] = mlflow.pytorch.log_model(target_critic, artifact_path="target_critic")
-        mlflow.log_dict(cfg.to_log, "config.json")
-    return model_info

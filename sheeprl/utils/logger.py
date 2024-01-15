@@ -1,38 +1,23 @@
 import os
 import warnings
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-import hydra
 from lightning import Fabric
-from lightning.fabric.loggers.logger import Logger
+from lightning.fabric.loggers import TensorBoardLogger
 from lightning.fabric.plugins.collectives import TorchCollective
 from lightning.fabric.utilities.cloud_io import _is_dir, get_filesystem
 
 
-def get_logger(fabric: Fabric, cfg: Dict[str, Any]) -> Optional[Logger]:
+def create_tensorboard_logger(fabric: Fabric, cfg: Dict[str, Any]) -> Tuple[Optional[TensorBoardLogger]]:
     # Set logger only on rank-0 but share the logger directory: since we don't know
     # what is happening during the `fabric.save()` method, at least we assure that all
     # ranks save under the same named folder.
     # As a plus, rank-0 sets the time uniquely for everyone
     logger = None
-    if fabric.is_global_zero and cfg.metric.log_level > 0:
-        if "tensorboard" in cfg.metric.logger._target_.lower():
-            root_dir = os.path.join("logs", "runs", cfg.root_dir)
-            if root_dir != cfg.metric.logger.root_dir:
-                warnings.warn(
-                    "The specified root directory for the TensorBoardLogger is different from the experiment one, "
-                    "so the logger one will be ignored and replaced with the experiment root directory",
-                    UserWarning,
-                )
-            if cfg.run_name != cfg.metric.logger.name:
-                warnings.warn(
-                    "The specified name for the TensorBoardLogger is different from the `run_name` of the experiment, "
-                    "so the logger one will be ignored and replaced with the experiment `run_name`",
-                    UserWarning,
-                )
-            cfg.metric.logger.root_dir = root_dir
-            cfg.metric.logger.name = cfg.run_name
-        logger = hydra.utils.instantiate(cfg.metric.logger, _convert_="all")
+    if fabric.is_global_zero:
+        root_dir = os.path.join("logs", "runs", cfg.root_dir)
+        if cfg.metric.log_level > 0:
+            logger = TensorBoardLogger(root_dir=root_dir, name=cfg.run_name)
     return logger
 
 
@@ -55,7 +40,7 @@ def get_log_dir(fabric: Fabric, root_dir: str, run_name: str, share: bool = True
         world_collective.create_group()
     if fabric.is_global_zero:
         # If the logger was instantiated, then take the log_dir from it
-        if len(fabric.loggers) > 0 and fabric.logger.log_dir is not None:
+        if len(fabric.loggers) > 0:
             log_dir = fabric.logger.log_dir
         else:
             # Otherwise the rank-zero process creates the log_dir

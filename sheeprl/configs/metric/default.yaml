@@ -1,7 +1,3 @@
-defaults:
-  - _self_
-  - /logger@logger: tensorboard
-
 log_every: 5000
 disable_timer: False
 

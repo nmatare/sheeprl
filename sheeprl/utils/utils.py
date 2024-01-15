@@ -1,33 +1,15 @@
 from __future__ import annotations
 
-import copy
 import os
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
-import numpy as np
 import rich.syntax
 import rich.tree
 import torch
 import torch.nn as nn
-from lightning.fabric.wrappers import _FabricModule
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.utilities import rank_zero_only
 from torch import Tensor
-
-NUMPY_TO_TORCH_DTYPE_DICT = {
-    np.dtype("bool"): torch.bool,
-    np.dtype("uint8"): torch.uint8,
-    np.dtype("int8"): torch.int8,
-    np.dtype("int16"): torch.int16,
-    np.dtype("int32"): torch.int32,
-    np.dtype("int64"): torch.int64,
-    np.dtype("float16"): torch.float16,
-    np.dtype("float32"): torch.float32,
-    np.dtype("float64"): torch.float64,
-    np.dtype("complex64"): torch.complex64,
-    np.dtype("complex128"): torch.complex128,
-}
-TORCH_TO_NUMPY_DTYPE_DICT = {value: key for key, value in NUMPY_TO_TORCH_DTYPE_DICT.items()}
 
 
 class dotdict(dict):
@@ -50,13 +32,6 @@ class dotdict(dict):
 
     def __setstate__(self, state):
         self.update(state)
-
-    def as_dict(self) -> Dict[str, Any]:
-        _copy = dict(self)
-        for k, v in _copy.items():
-            if isinstance(v, dotdict):
-                _copy[k] = v.as_dict()
-        return _copy
 
 
 @torch.no_grad()
@@ -182,16 +157,3 @@ def print_config(
     if cfg_save_path is not None:
         with open(os.path.join(os.getcwd(), "config_tree.txt"), "w") as fp:
             rich.print(tree, file=fp)
-
-
-def unwrap_fabric(model: _FabricModule | nn.Module) -> nn.Module:
-    model = copy.deepcopy(model)
-    if isinstance(model, _FabricModule):
-        model = model.module
-    for name, child in model.named_children():
-        setattr(model, name, unwrap_fabric(child))
-    return model
-
-
-def save_configs(cfg: dotdict, log_dir: str):
-    OmegaConf.save(cfg.as_dict(), os.path.join(log_dir, "config.yaml"), resolve=True)

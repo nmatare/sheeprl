@@ -1,22 +1,9 @@
-from __future__ import annotations
+from typing import Tuple
 
-import warnings
-from typing import TYPE_CHECKING, Any, Dict, Sequence, Tuple
-
-import gymnasium as gym
 import torch
 import torch.nn.functional as F
-from lightning import Fabric
-from lightning.fabric.wrappers import _FabricModule
 from torch import Tensor
 from torch.distributions import Distribution, Independent, Normal
-
-from sheeprl.utils.imports import _IS_MLFLOW_AVAILABLE
-from sheeprl.utils.utils import unwrap_fabric
-
-if TYPE_CHECKING:
-    from mlflow.models.model import ModelInfo
-
 
 AGGREGATOR_KEYS = {
     "Rewards/rew_avg",
@@ -36,7 +23,6 @@ AGGREGATOR_KEYS = {
     "Grads/actor",
     "Grads/critic",
 }
-MODELS_TO_REGISTER = {"world_model", "actor", "critic"}
 
 
 def compute_lambda_values(
@@ -105,65 +91,3 @@ def compute_stochastic_state(
         state_distribution = Independent(state_distribution, event_shape, validate_args=validate_args)
     stochastic_state = state_distribution.rsample()
     return (mean, std), stochastic_state
-
-
-def log_models(
-    cfg: Dict[str, Any],
-    models_to_log: Dict[str, torch.nn.Module | _FabricModule],
-    run_id: str,
-    experiment_id: str | None = None,
-    run_name: str | None = None,
-) -> Dict[str, "ModelInfo"]:
-    if not _IS_MLFLOW_AVAILABLE:
-        raise ModuleNotFoundError(str(_IS_MLFLOW_AVAILABLE))
-    import mlflow  # noqa
-
-    with mlflow.start_run(run_id=run_id, experiment_id=experiment_id, run_name=run_name, nested=True) as _:
-        model_info = {}
-        unwrapped_models = {}
-        for k in cfg.model_manager.models.keys():
-            if k not in models_to_log:
-                warnings.warn(f"Model {k} not found in models_to_log, skipping.", category=UserWarning)
-                continue
-            unwrapped_models[k] = unwrap_fabric(models_to_log[k])
-            model_info[k] = mlflow.pytorch.log_model(unwrapped_models[k], artifact_path=k)
-        mlflow.log_dict(cfg, "config.json")
-    return model_info
-
-
-def log_models_from_checkpoint(
-    fabric: Fabric, env: gym.Env | gym.Wrapper, cfg: Dict[str, Any], state: Dict[str, Any]
-) -> Sequence["ModelInfo"]:
-    if not _IS_MLFLOW_AVAILABLE:
-        raise ModuleNotFoundError(str(_IS_MLFLOW_AVAILABLE))
-    import mlflow  # noqa
-
-    from sheeprl.algos.dreamer_v1.agent import build_agent
-
-    # Create the models
-    is_continuous = isinstance(env.action_space, gym.spaces.Box)
-    is_multidiscrete = isinstance(env.action_space, gym.spaces.MultiDiscrete)
-    actions_dim = tuple(
-        env.action_space.shape
-        if is_continuous
-        else (env.action_space.nvec.tolist() if is_multidiscrete else [env.action_space.n])
-    )
-    world_model, actor, critic = build_agent(
-        fabric,
-        actions_dim,
-        is_continuous,
-        cfg,
-        env.observation_space,
-        state["world_model"],
-        state["actor"],
-        state["critic"],
-    )
-
-    # Log the model, create a new run if `cfg.run_id` is None.
-    model_info = {}
-    with mlflow.start_run(run_id=cfg.run.id, experiment_id=cfg.experiment.id, run_name=cfg.run.name, nested=True) as _:
-        model_info["world_model"] = mlflow.pytorch.log_model(unwrap_fabric(world_model), artifact_path="world_model")
-        model_info["actor"] = mlflow.pytorch.log_model(unwrap_fabric(actor), artifact_path="actor")
-        model_info["critic"] = mlflow.pytorch.log_model(unwrap_fabric(critic), artifact_path="critic")
-        mlflow.log_dict(cfg.to_log, "config.json")
-    return model_info

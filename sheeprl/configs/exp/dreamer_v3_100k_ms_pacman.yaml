@@ -7,6 +7,7 @@ defaults:
 
 # Experiment
 seed: 5
+total_steps: 100000
 
 # Environment
 env:
@@ -26,7 +27,6 @@ buffer:
 # Algorithm
 algo:
   learning_starts: 1024
-  total_steps: 100000
   train_every: 1
   dense_units: 512
   mlp_layers: 2

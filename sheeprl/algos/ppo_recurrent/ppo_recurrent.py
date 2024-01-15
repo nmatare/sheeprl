@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import os
 import warnings
 from contextlib import nullcontext
@@ -11,35 +12,35 @@ import hydra
 import numpy as np
 import torch
 from lightning.fabric import Fabric
-from torch import Tensor
+from tensordict import TensorDict, pad_sequence
+from tensordict.tensordict import TensorDictBase
 from torch.distributed.algorithms.join import Join
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torchmetrics import SumMetric
 
 from sheeprl.algos.ppo.loss import entropy_loss, policy_loss, value_loss
-from sheeprl.algos.ppo.utils import normalize_obs
-from sheeprl.algos.ppo_recurrent.agent import RecurrentPPOAgent, build_agent
+from sheeprl.algos.ppo_recurrent.agent import RecurrentPPOAgent
 from sheeprl.algos.ppo_recurrent.utils import test
 from sheeprl.data.buffers import ReplayBuffer
 from sheeprl.utils.env import make_env
-from sheeprl.utils.logger import get_log_dir, get_logger
+from sheeprl.utils.logger import create_tensorboard_logger, get_log_dir
 from sheeprl.utils.metric import MetricAggregator
 from sheeprl.utils.registry import register_algorithm
 from sheeprl.utils.timer import timer
-from sheeprl.utils.utils import gae, normalize_tensor, polynomial_decay, save_configs
+from sheeprl.utils.utils import gae, normalize_tensor, polynomial_decay
 
 
 def train(
     fabric: Fabric,
     agent: RecurrentPPOAgent,
     optimizer: torch.optim.Optimizer,
-    data: Dict[str, Tensor],
+    data: TensorDictBase,
     aggregator: MetricAggregator | None,
     cfg: Dict[str, Any],
 ):
-    num_sequences = data[next(iter(data.keys()))].shape[1]
-    if cfg.algo.per_rank_num_batches > 0:
-        batch_size = num_sequences // cfg.algo.per_rank_num_batches
+    num_sequences = data.shape[1]
+    if cfg.per_rank_num_batches > 0:
+        batch_size = num_sequences // cfg.per_rank_num_batches
         batch_size = batch_size if batch_size > 0 else num_sequences
     else:
         batch_size = 1
@@ -51,13 +52,13 @@ def train(
                 drop_last=False,
             )  # Random sampling sequences
             for idxes in sampler:
-                batch = {k: v[:, idxes] for k, v in data.items()}
+                batch = data[:, idxes]
                 mask = batch["mask"].unsqueeze(-1)
-                for k in cfg.algo.cnn_keys.encoder:
+                for k in cfg.cnn_keys.encoder:
                     batch[k] = batch[k] / 255.0 - 0.5
 
                 _, logprobs, entropies, values, _ = agent(
-                    {k: batch[k] for k in set(cfg.algo.cnn_keys.encoder + cfg.algo.mlp_keys.encoder)},
+                    {k: batch[k] for k in set(cfg.cnn_keys.encoder + cfg.mlp_keys.encoder)},
                     prev_actions=batch["prev_actions"],
                     prev_states=(batch["prev_hx"][:1], batch["prev_cx"][:1]),
                     actions=torch.split(batch["actions"], agent.actions_dim, dim=-1),
@@ -133,15 +134,15 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     # Resume from checkpoint
     if cfg.checkpoint.resume_from:
         state = fabric.load(cfg.checkpoint.resume_from)
+        cfg.per_rank_batch_size = state["batch_size"] // fabric.world_size
 
-    # Create Logger. This will create the logger only on the
+    # Create TensorBoardLogger. This will create the logger only on the
     # rank-0 process
-    logger = get_logger(fabric, cfg)
+    logger = create_tensorboard_logger(fabric, cfg)
     if logger and fabric.is_global_zero:
         fabric._loggers = [logger]
         fabric.logger.log_hyperparams(cfg)
     log_dir = get_log_dir(fabric, cfg.root_dir, cfg.run_name)
-    fabric.print(f"Log dir: {log_dir}")
 
     # Environment setup
     vectorized_env = gym.vector.SyncVectorEnv if cfg.env.sync_env else gym.vector.AsyncVectorEnv
@@ -162,49 +163,55 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
 
     if not isinstance(observation_space, gym.spaces.Dict):
         raise RuntimeError(f"Unexpected observation type, should be of type Dict, got: {observation_space}")
-    if cfg.algo.cnn_keys.encoder + cfg.algo.mlp_keys.encoder == []:
+    if cfg.cnn_keys.encoder + cfg.mlp_keys.encoder == []:
         raise RuntimeError(
             "You should specify at least one CNN keys or MLP keys from the cli: "
             "`cnn_keys.encoder=[rgb]` or `mlp_keys.encoder=[state]`"
         )
     if cfg.metric.log_level > 0:
-        fabric.print("Encoder CNN keys:", cfg.algo.cnn_keys.encoder)
-        fabric.print("Encoder MLP keys:", cfg.algo.mlp_keys.encoder)
-    obs_keys = cfg.algo.cnn_keys.encoder + cfg.algo.mlp_keys.encoder
+        fabric.print("Encoder CNN keys:", cfg.cnn_keys.encoder)
+        fabric.print("Encoder MLP keys:", cfg.mlp_keys.encoder)
+    obs_keys = cfg.cnn_keys.encoder + cfg.mlp_keys.encoder
 
     is_continuous = isinstance(envs.single_action_space, gym.spaces.Box)
     is_multidiscrete = isinstance(envs.single_action_space, gym.spaces.MultiDiscrete)
-    actions_dim = tuple(
+    actions_dim = (
         envs.single_action_space.shape
         if is_continuous
         else (envs.single_action_space.nvec.tolist() if is_multidiscrete else [envs.single_action_space.n])
     )
 
     # Define the agent and the optimizer
-    agent = build_agent(
-        fabric,
-        actions_dim,
-        is_continuous,
-        cfg,
-        observation_space,
-        state["agent"] if cfg.checkpoint.resume_from else None,
+    agent = RecurrentPPOAgent(
+        actions_dim=actions_dim,
+        obs_space=observation_space,
+        encoder_cfg=cfg.algo.encoder,
+        rnn_cfg=cfg.algo.rnn,
+        actor_cfg=cfg.algo.actor,
+        critic_cfg=cfg.algo.critic,
+        cnn_keys=cfg.cnn_keys.encoder,
+        mlp_keys=cfg.mlp_keys.encoder,
+        is_continuous=is_continuous,
+        distribution_cfg=cfg.distribution,
+        num_envs=cfg.env.num_envs,
+        screen_size=cfg.env.screen_size,
+        device=device,
     )
-    models_to_log = {"agent": agent}
-    optimizer = hydra.utils.instantiate(cfg.algo.optimizer, params=agent.parameters(), _convert_="all")
+    optimizer = hydra.utils.instantiate(cfg.algo.optimizer, params=agent.parameters())
 
     # Load the state from the checkpoint
     if cfg.checkpoint.resume_from:
+        agent.load_state_dict(state["agent"])
         optimizer.load_state_dict(state["optimizer"])
-    # Setup agent and optimizer with Fabric
-    optimizer = fabric.setup_optimizers(optimizer)
 
-    if fabric.is_global_zero:
-        save_configs(cfg, log_dir)
+    # Setup agent and optimizer with Fabric
+    agent = fabric.setup_module(agent)
+    optimizer = fabric.setup_optimizers(optimizer)
 
     # Create a metric aggregator to log the metrics
     aggregator = None
     if not MetricAggregator.disabled:
-        aggregator: MetricAggregator = hydra.utils.instantiate(cfg.metric.aggregator, _convert_="all").to(device)
+        aggregator: MetricAggregator = hydra.utils.instantiate(cfg.metric.aggregator).to(device)
 
     # Local data
     rb = ReplayBuffer(
@@ -214,29 +221,21 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         memmap=cfg.buffer.memmap,
         memmap_dir=os.path.join(log_dir, "memmap_buffer", f"rank_{fabric.global_rank}"),
     )
+    step_data = TensorDict({}, batch_size=[1, cfg.env.num_envs], device=device)
 
     # Check that `rollout_steps` = k * `per_rank_sequence_length`
-    if cfg.algo.rollout_steps % cfg.algo.per_rank_sequence_length != 0:
+    if cfg.algo.rollout_steps % cfg.per_rank_sequence_length != 0:
         pass
 
     # Global variables
     last_train = 0
     train_step = 0
-    start_step = (
-        # + 1 because the checkpoint is at the end of the update step
-        # (when resuming from a checkpoint, the update at the checkpoint
-        # is ended and you have to start with the next one)
-        (state["update"] // fabric.world_size) + 1
-        if cfg.checkpoint.resume_from
-        else 1
-    )
+    start_step = state["update"] // fabric.world_size if cfg.checkpoint.resume_from else 1
     policy_step = state["update"] * cfg.env.num_envs * cfg.algo.rollout_steps if cfg.checkpoint.resume_from else 0
     last_log = state["last_log"] if cfg.checkpoint.resume_from else 0
     last_checkpoint = state["last_checkpoint"] if cfg.checkpoint.resume_from else 0
     policy_steps_per_update = int(cfg.env.num_envs * cfg.algo.rollout_steps * world_size)
-    num_updates = cfg.algo.total_steps // policy_steps_per_update if not cfg.dry_run else 1
-    if cfg.checkpoint.resume_from:
-        cfg.algo.per_rank_batch_size = state["batch_size"] // fabric.world_size
+    num_updates = cfg.total_steps // policy_steps_per_update if not cfg.dry_run else 1
 
     # Warning for log and checkpoint every
     if cfg.metric.log_level > 0 and cfg.metric.log_every % policy_steps_per_update != 0:
@@ -263,18 +262,20 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             scheduler.load_state_dict(state["scheduler"])
 
     # Get the first environment observation and start the optimization
-    step_data = {}
-    obs = envs.reset(seed=cfg.seed)[0]  # [N_envs, N_obs]
+    o = envs.reset(seed=cfg.seed)[0]  # [N_envs, N_obs]
+    obs = {}
     for k in obs_keys:
-        if k in cfg.algo.cnn_keys.encoder:
-            obs[k] = obs[k].reshape(cfg.env.num_envs, -1, *obs[k].shape[-2:])
-        obs[k] = obs[k][np.newaxis]
-        step_data[k] = obs[k]
+        torch_obs = torch.as_tensor(o[k], device=fabric.device)
+        if k in cfg.cnn_keys.encoder:
+            torch_obs = torch_obs.view(cfg.env.num_envs, -1, *torch_obs.shape[-2:])
+        elif k in cfg.mlp_keys.encoder:
+            torch_obs = torch_obs.float()
+        step_data[k] = torch_obs[None]  # [Seq_len, Batch_size, D] --> [1, num_envs, D]
+        obs[k] = torch_obs
 
     # Get the resetted recurrent states from the agent
     prev_states = agent.initial_states
-    prev_actions = np.zeros((1, cfg.env.num_envs, sum(actions_dim)))
-    torch_prev_actions = torch.zeros(1, cfg.env.num_envs, sum(actions_dim), device=device, dtype=torch.float32)
+    prev_actions = torch.zeros(1, cfg.env.num_envs, sum(actions_dim), device=fabric.device)
 
     for update in range(start_step, num_updates + 1):
         for _ in range(0, cfg.algo.rollout_steps):
@@ -282,21 +283,20 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
 
             # Measure environment interaction time: this considers both the model forward
             # to get the action given the observation and the time taken into the environment
-            with timer("Time/env_interaction_time", SumMetric, sync_on_compute=False):
+            with timer("Time/env_interaction_time", SumMetric(sync_on_compute=False)):
                 with torch.no_grad():
                     # Sample an action given the observation received by the environment
-                    # [Seq_len, Batch_size, D] --> [1, num_envs, D]
-                    normalized_obs = normalize_obs(obs, cfg.algo.cnn_keys.encoder, obs_keys)
-                    torch_obs = {k: torch.as_tensor(v, device=device).float() for k, v in normalized_obs.items()}
+                    normalized_obs = {
+                        k: obs[k][None] / 255.0 - 0.5 if k in cfg.cnn_keys.encoder else obs[k][None] for k in obs_keys
+                    }  # [Seq_len, Batch_size, D] --> [1, num_envs, D]
                     actions, logprobs, _, values, states = agent.module(
-                        torch_obs, prev_actions=torch_prev_actions, prev_states=prev_states
+                        normalized_obs, prev_actions=prev_actions, prev_states=prev_states
                     )
                     if is_continuous:
                         real_actions = torch.cat(actions, -1).cpu().numpy()
                     else:
-                        real_actions = torch.cat([act.argmax(dim=-1) for act in actions], dim=-1).cpu().numpy()
-                    torch_actions = torch.cat(actions, dim=-1)
-                    actions = torch_actions.cpu().numpy()
+                        real_actions = np.concatenate([act.argmax(dim=-1).cpu().numpy() for act in actions], axis=-1)
+                    actions = torch.cat(actions, dim=-1)
 
                 # Single environment step
                 next_obs, rewards, dones, truncated, info = envs.step(real_actions.reshape(envs.action_space.shape))
@@ -315,50 +315,53 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                     for i, truncated_env in enumerate(truncated_envs):
                         for k, v in info["final_observation"][truncated_env].items():
                             torch_v = torch.as_tensor(v, dtype=torch.float32, device=device)
-                            if k in cfg.algo.cnn_keys.encoder:
-                                torch_v = torch_v.view(1, 1, -1, *torch_v.shape[-2:]) / 255.0 - 0.5
+                            if k in cfg.cnn_keys.encoder:
+                                torch_v = torch_v.view(1, len(truncated_envs), -1, *torch_obs.shape[-2:]) / 255.0 - 0.5
                             real_next_obs[k][0, i] = torch_v
                     with torch.no_grad():
                         feat = agent.module.feature_extractor(real_next_obs)
                         rnn_out, _ = agent.module.rnn(
-                            torch.cat((feat, torch_actions[:, truncated_envs, :]), dim=-1),
+                            torch.cat((feat, actions[:, truncated_envs, :]), dim=-1),
                             tuple(s[:, truncated_envs, ...] for s in states),
                         )
                         vals = agent.module.get_values(rnn_out).view(rewards[truncated_envs].shape).cpu().numpy()
                         rewards[truncated_envs] += vals.reshape(rewards[truncated_envs].shape)
-                dones = np.logical_or(dones, truncated).reshape(1, cfg.env.num_envs, -1).astype(np.float32)
-                rewards = rewards.reshape(1, cfg.env.num_envs, -1).astype(np.float32)
+                dones = np.logical_or(dones, truncated)
+                dones = torch.as_tensor(dones, dtype=torch.float32, device=device).view(1, cfg.env.num_envs, -1)
+                rewards = torch.as_tensor(rewards, dtype=torch.float32, device=device).view(1, cfg.env.num_envs, -1)
 
-            step_data["dones"] = dones.reshape(1, cfg.env.num_envs, -1)
-            step_data["values"] = values.cpu().numpy().reshape(1, cfg.env.num_envs, -1)
-            step_data["actions"] = actions.reshape(1, cfg.env.num_envs, -1)
-            step_data["rewards"] = rewards.reshape(1, cfg.env.num_envs, -1)
-            step_data["logprobs"] = logprobs.cpu().numpy()
-            step_data["prev_hx"] = prev_states[0].cpu().numpy().reshape(1, cfg.env.num_envs, -1)
-            step_data["prev_cx"] = prev_states[1].cpu().numpy().reshape(1, cfg.env.num_envs, -1)
-            step_data["prev_actions"] = prev_actions.reshape(1, cfg.env.num_envs, -1)
+            step_data["dones"] = dones
+            step_data["values"] = values
+            step_data["actions"] = actions
+            step_data["rewards"] = rewards
+            step_data["logprobs"] = logprobs
+            step_data["prev_hx"] = prev_states[0]
+            step_data["prev_cx"] = prev_states[1]
+            step_data["prev_actions"] = prev_actions
             if cfg.buffer.memmap:
-                step_data["returns"] = np.zeros_like(rewards)
-                step_data["advantages"] = np.zeros_like(rewards)
+                step_data["returns"] = torch.zeros_like(rewards)
+                step_data["advantages"] = torch.zeros_like(rewards)
 
             # Append data to buffer
-            rb.add(step_data, validate_args=cfg.buffer.validate_args)
+            rb.add(step_data)
 
             # Update actions
             prev_actions = (1 - dones) * actions
-            torch_prev_actions = torch.from_numpy(prev_actions).to(device).float()
 
             # Update the observation
-            obs = next_obs
+            obs = {}
             for k in obs_keys:
-                obs[k] = obs[k][np.newaxis]
-                if k in cfg.algo.cnn_keys.encoder:
-                    obs[k] = obs[k].reshape(1, cfg.env.num_envs, -1, *obs[k].shape[-2:])
-                step_data[k] = obs[k]
+                if k in cfg.cnn_keys.encoder:
+                    torch_obs = torch.as_tensor(next_obs[k], device=device)
+                    torch_obs = torch_obs.view(cfg.env.num_envs, -1, *torch_obs.shape[-2:])
+                elif k in cfg.mlp_keys.encoder:
+                    torch_obs = torch.as_tensor(next_obs[k], device=device, dtype=torch.float32)
+                step_data[k] = torch_obs[None]
+                obs[k] = torch_obs
 
             # Reset the states if the episode is done
             if cfg.algo.reset_recurrent_state_on_done:
-                prev_states = tuple([(1 - torch.as_tensor(dones, device=device)) * s for s in states])
+                prev_states = tuple([(1 - dones) * s for s in states])
             else:
                 prev_states = states
 
@@ -372,20 +375,18 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                             aggregator.update("Game/ep_len_avg", ep_len)
                         fabric.print(f"Rank-0: policy_step={policy_step}, reward_env_{i}={ep_rew[-1]}")
 
-        # Transform the data into PyTorch Tensors
-        local_data = rb.to_tensor(dtype=None, device=device, from_numpy=cfg.buffer.from_numpy)
-
         # Estimate returns with GAE (https://arxiv.org/abs/1506.02438)
         with torch.no_grad():
-            normalized_obs = normalize_obs(obs, cfg.algo.cnn_keys.encoder, obs_keys)
-            torch_obs = {k: torch.as_tensor(v, device=device).float() for k, v in normalized_obs.items()}
-            feat = agent.module.feature_extractor(torch_obs)
-            rnn_out, _ = agent.module.rnn(torch.cat((feat, torch_actions), dim=-1), states)
+            normalized_obs = {
+                k: obs[k][None] / 255.0 - 0.5 if k in cfg.cnn_keys.encoder else obs[k][None] for k in obs_keys
+            }
+            feat = agent.module.feature_extractor(normalized_obs)
+            rnn_out, _ = agent.module.rnn(torch.cat((feat, actions), dim=-1), states)
             next_values = agent.module.get_values(rnn_out)
             returns, advantages = gae(
-                local_data["rewards"].to(torch.float64),
-                local_data["values"],
-                local_data["dones"],
+                rb["rewards"],
+                rb["values"],
+                rb["dones"],
                 next_values,
                 cfg.algo.rollout_steps,
                 cfg.algo.gamma,
@@ -393,16 +394,17 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             )
 
             # Add returns and advantages to the buffer
-            local_data["rewards"] = local_data["rewards"].float()
-            local_data["returns"] = returns.float()
-            local_data["advantages"] = advantages.float()
+            rb["returns"] = returns.float()
+            rb["advantages"] = advantages.float()
+
+        # Get the training data as a TensorDict
+        local_data = rb.buffer
 
         # Train the agent
         # 1. Split data into episodes (for every environment)
-        episodes: List[Dict[str, Tensor]] = []
-        lengths = []
+        episodes: List[TensorDictBase] = []
         for env_id in range(cfg.env.num_envs):
-            env_data = {k: v[:, env_id].float() for k, v in local_data.items()}  # [N_steps, *]
+            env_data = local_data[:, env_id]  # [N_steps, *]
             episode_ends = env_data["dones"].nonzero(as_tuple=True)[0]
             episode_ends = episode_ends.tolist()
             episode_ends.append(cfg.algo.rollout_steps)
@@ -411,35 +413,18 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 stop = ep_end_idx
                 # Include the done, since when we encounter a done it means that
                 # the episode has ended
-                episode = {k: v[start : stop + 1] for k, v in env_data.items() if len(v[start : stop + 1]) > 0}
+                episode = env_data[start : stop + 1]
                 if len(episode) > 0:
                     episodes.append(episode)
-                    lengths.append(episode[next(iter(episode.keys()))].shape[0])
                 start = stop + 1
         # 2. Split every episode into sequences of length `per_rank_sequence_length`
-        if cfg.algo.per_rank_sequence_length is not None and cfg.algo.per_rank_sequence_length > 0:
-            lengths = []
-            sl = cfg.algo.per_rank_sequence_length
-            sequences = {k: [] for k in episodes[0].keys()}
-            for ep in episodes:
-                for k in sequences.keys():
-                    seq = torch.split(ep[k], sl)
-                    sequences[k].extend(seq)
-                # Regardless of the key, the shapes are the same
-                lengths.extend([s.shape[0] for s in seq])
-
+        if cfg.per_rank_sequence_length is not None and cfg.per_rank_sequence_length > 0:
+            sequences = list(itertools.chain.from_iterable([ep.split(cfg.per_rank_sequence_length) for ep in episodes]))
         else:
             sequences = episodes
+        padded_sequences = pad_sequence(sequences, batch_first=False, return_mask=True)  # [Seq_len, Num_seq, *]
 
-        padded_sequences = {
-            k: torch.nn.utils.rnn.pad_sequence(v, batch_first=False, padding_value=0) for k, v in sequences.items()
-        }
-        max_len = max(lengths)
-        lengths = torch.as_tensor(lengths)
-        mask = (torch.arange(max_len).expand(len(lengths), max_len) < lengths.unsqueeze(1)).T
-        padded_sequences["mask"] = mask.to(device).bool()
-
-        with timer("Time/train_time", SumMetric, sync_on_compute=cfg.metric.sync_on_compute):
+        with timer("Time/train_time", SumMetric(sync_on_compute=cfg.metric.sync_on_compute)):
             train(fabric, agent, optimizer, padded_sequences, aggregator, cfg)
         train_step += world_size
 
@@ -502,7 +487,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict() if cfg.algo.anneal_lr else None,
                 "update": update * world_size,
-                "batch_size": cfg.algo.per_rank_batch_size * fabric.world_size,
+                "batch_size": cfg.per_rank_batch_size * fabric.world_size,
                 "last_log": last_log,
                 "last_checkpoint": last_checkpoint,
             }
@@ -510,11 +495,5 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             fabric.call("on_checkpoint_coupled", fabric=fabric, ckpt_path=ckpt_path, state=ckpt_state)
 
     envs.close()
-    if fabric.is_global_zero and cfg.algo.run_test:
+    if fabric.is_global_zero:
         test(agent.module, fabric, cfg, log_dir)
-
-    if not cfg.model_manager.disabled and fabric.is_global_zero:
-        from sheeprl.algos.ppo.utils import log_models
-        from sheeprl.utils.mlflow import register_model
-
-        register_model(fabric, log_models, cfg, models_to_log)

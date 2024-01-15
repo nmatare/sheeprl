@@ -1,4 +1,3 @@
 every: 100
 resume_from: null
 save_last: True
-keep_last: 5

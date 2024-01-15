@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any, Dict, Sequence
+from typing import TYPE_CHECKING, Any, Dict
 
 import gymnasium as gym
 import numpy as np
@@ -9,12 +7,8 @@ from lightning import Fabric
 from torch import Tensor, nn
 
 from sheeprl.utils.env import make_env
-from sheeprl.utils.imports import _IS_MLFLOW_AVAILABLE
-from sheeprl.utils.utils import unwrap_fabric
 
 if TYPE_CHECKING:
-    from mlflow.models.model import ModelInfo
-
     from sheeprl.algos.dreamer_v3.agent import PlayerDV3
 
 AGGREGATOR_KEYS = {
@@ -34,19 +28,28 @@ AGGREGATOR_KEYS = {
     "Grads/world_model",
     "Grads/actor",
     "Grads/critic",
+    # custom
+    "User/LambdaValues",
+    "User/Advantages",
+    "User/Entropy",
+    "User/PredictedRewards",
+    "User/PredictedValues",
+    "User/DynLoss",
+    "User/ReprLoss",
 }
-MODELS_TO_REGISTER = {"world_model", "actor", "critic", "target_critic", "moments"}
 
 
 class Moments(nn.Module):
     def __init__(
         self,
+        fabric: Fabric,
         decay: float = 0.99,
         max_: float = 1e8,
         percentile_low: float = 0.05,
         percentile_high: float = 0.95,
     ) -> None:
         super().__init__()
+        self._fabric = fabric
         self._decay = decay
         self._max = torch.tensor(max_)
         self._percentile_low = percentile_low
@@ -54,8 +57,8 @@ class Moments(nn.Module):
         self.register_buffer("low", torch.zeros((), dtype=torch.float32))
         self.register_buffer("high", torch.zeros((), dtype=torch.float32))
 
-    def forward(self, x: Tensor, fabric: Fabric) -> Any:
-        gathered_x = fabric.all_gather(x).detach()
+    def forward(self, x: Tensor) -> Any:
+        gathered_x = self._fabric.all_gather(x).detach()
         low = torch.quantile(gathered_x, self._percentile_low)
         high = torch.quantile(gathered_x, self._percentile_high)
         self.low = self._decay * self.low + (1 - self._decay) * low
@@ -112,9 +115,9 @@ def test(
         # Act greedly through the environment
         preprocessed_obs = {}
         for k, v in next_obs.items():
-            if k in cfg.algo.cnn_keys.encoder:
+            if k in cfg.cnn_keys.encoder:
                 preprocessed_obs[k] = v[None, ...].to(device) / 255
-            elif k in cfg.algo.mlp_keys.encoder:
+            elif k in cfg.mlp_keys.encoder:
                 preprocessed_obs[k] = v[None, ...].to(device)
         real_actions = player.get_greedy_action(
             preprocessed_obs, sample_actions, {k: v for k, v in preprocessed_obs.items() if k.startswith("mask")}
@@ -122,7 +125,7 @@ def test(
         if player.actor.is_continuous:
             real_actions = torch.cat(real_actions, -1).cpu().numpy()
         else:
-            real_actions = torch.cat([real_act.argmax(dim=-1) for real_act in real_actions], dim=-1).cpu().numpy()
+            real_actions = np.array([real_act.cpu().argmax(dim=-1).numpy() for real_act in real_actions])
 
         # Single environment step
         next_obs, reward, done, truncated, _ = env.step(real_actions.reshape(env.action_space.shape))
@@ -181,52 +184,3 @@ def uniform_init_weights(given_scale):
                 m.bias.data.fill_(0.0)
 
     return f
-
-
-def log_models_from_checkpoint(
-    fabric: Fabric, env: gym.Env | gym.Wrapper, cfg: Dict[str, Any], state: Dict[str, Any]
-) -> Sequence["ModelInfo"]:
-    if not _IS_MLFLOW_AVAILABLE:
-        raise ModuleNotFoundError(str(_IS_MLFLOW_AVAILABLE))
-    import mlflow  # noqa
-
-    from sheeprl.algos.dreamer_v3.agent import build_agent
-
-    # Create the models
-    is_continuous = isinstance(env.action_space, gym.spaces.Box)
-    is_multidiscrete = isinstance(env.action_space, gym.spaces.MultiDiscrete)
-    actions_dim = tuple(
-        env.action_space.shape
-        if is_continuous
-        else (env.action_space.nvec.tolist() if is_multidiscrete else [env.action_space.n])
-    )
-    world_model, actor, critic, target_critic = build_agent(
-        fabric,
-        actions_dim,
-        is_continuous,
-        cfg,
-        env.observation_space,
-        state["world_model"],
-        state["actor"],
-        state["critic"],
-        state["target_critic"],
-    )
-    moments = Moments(
-        fabric,
-        cfg.algo.actor.moments.decay,
-        cfg.algo.actor.moments.max,
-        cfg.algo.actor.moments.percentile.low,
-        cfg.algo.actor.moments.percentile.high,
-    )
-    moments.load_state_dict(state["moments"])
-
-    # Log the model, create a new run if `cfg.run_id` is None.
-    model_info = {}
-    with mlflow.start_run(run_id=cfg.run.id, experiment_id=cfg.experiment.id, run_name=cfg.run.name, nested=True) as _:
-        model_info["world_model"] = mlflow.pytorch.log_model(unwrap_fabric(world_model), artifact_path="world_model")
-        model_info["actor"] = mlflow.pytorch.log_model(unwrap_fabric(actor), artifact_path="actor")
-        model_info["critic"] = mlflow.pytorch.log_model(unwrap_fabric(critic), artifact_path="critic")
-        model_info["target_critic"] = mlflow.pytorch.log_model(target_critic, artifact_path="target_critic")
-        model_info["moments"] = mlflow.pytorch.log_model(moments, artifact_path="moments")
-        mlflow.log_dict(cfg.to_log, "config.json")
-    return model_info

@@ -1,27 +1,29 @@
+import datetime
 import importlib
 import os
 import pathlib
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Dict
 
 import hydra
 from lightning import Fabric
+from lightning.fabric.loggers.tensorboard import TensorBoardLogger
 from lightning.fabric.strategies import STRATEGY_REGISTRY, DDPStrategy, SingleDeviceStrategy, Strategy
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf
 
-from sheeprl.utils.imports import _IS_MLFLOW_AVAILABLE
-from sheeprl.utils.logger import get_logger
 from sheeprl.utils.metric import MetricAggregator
 from sheeprl.utils.registry import algorithm_registry, evaluation_registry
 from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import dotdict, print_config
 
 
-def resume_from_checkpoint(cfg: DictConfig) -> DictConfig:
+def resume_from_checkpoint(cfg: DictConfig) -> Dict[str, Any]:
+    root_dir = cfg.root_dir
+    run_name = cfg.run_name
     ckpt_path = pathlib.Path(cfg.checkpoint.resume_from)
-    old_cfg = OmegaConf.load(ckpt_path.parent.parent / "config.yaml")
-    old_cfg = dotdict(OmegaConf.to_container(old_cfg, resolve=True, throw_on_missing=True))
+    old_cfg = OmegaConf.load(ckpt_path.parent.parent.parent / ".hydra" / "config.yaml")
     if old_cfg.env.id != cfg.env.id:
         raise ValueError(
             "This experiment is run with a different environment from the one of the experiment you want to restart. "
@@ -34,15 +36,12 @@ def resume_from_checkpoint(cfg: DictConfig) -> DictConfig:
             f"Got '{cfg.algo.name}', but the algorithm of the experiment of the checkpoint was {old_cfg.algo.name}. "
             "Set properly the algorithm name for restarting the experiment."
         )
-
-    # Remove keys from the `old_cfg` that must not be overridden
     old_cfg.pop("root_dir", None)
     old_cfg.pop("run_name", None)
-    old_cfg.checkpoint.pop("resume_from", None)
-    # Substitute the config with the old one (except for the parameters removed before)
-    # because the experiment must continue with the same parameters
-    with open_dict(cfg):
-        cfg.merge_with(old_cfg.as_dict())
+    cfg = dotdict(old_cfg)
+    cfg.checkpoint.resume_from = str(ckpt_path)
+    cfg.root_dir = root_dir
+    cfg.run_name = run_name
     return cfg
 
 
@@ -79,13 +78,23 @@ def run_algorithm(cfg: Dict[str, Any]):
     command = task.__dict__[entrypoint]
     kwargs = {}
     if decoupled:
+        root_dir = (
+            os.path.join("logs", "runs", cfg.root_dir)
+            if cfg.root_dir is not None
+            else os.path.join("logs", "runs", algo_name, datetime.today().strftime("%Y-%m-%d_%H-%M-%S"))
+        )
+        run_name = (
+            cfg.run_name if cfg.run_name is not None else f"{cfg.env.id}_{cfg.exp_name}_{cfg.seed}_{int(time.time())}"
+        )
+        logger = None
+        if cfg.metric.log_level > 0:
+            logger = TensorBoardLogger(root_dir=root_dir, name=run_name)
+            logger.log_hyperparams(cfg)
         fabric: Fabric = hydra.utils.instantiate(cfg.fabric, _convert_="all")
-        logger = get_logger(fabric, cfg)
-        if logger and fabric.is_global_zero:
-            fabric._loggers = [logger]
-            fabric.logger.log_hyperparams(cfg)
+        if logger is not None:
+            fabric._loggers.extend([logger])
     else:
-        strategy = cfg.fabric.get("strategy", "auto")
+        strategy = cfg.fabric.pop("strategy", "auto")
         if "sac_ae" in module:
             if strategy is not None:
                 warnings.warn(
@@ -93,12 +102,13 @@ def run_algorithm(cfg: Dict[str, Any]):
                     f"'python sheeprl.py fabric.strategy={strategy}'. This algorithm is run with the "
                     "'lightning.fabric.strategies.DDPStrategy' strategy."
                 )
-            cfg.fabric.pop("strategy", "auto")
             strategy = DDPStrategy(find_unused_parameters=True)
         elif "finetuning" in algo_name and "p2e" in module:
             # Load exploration configurations
             ckpt_path = pathlib.Path(cfg.checkpoint.exploration_ckpt_path)
-            exploration_cfg = OmegaConf.load(ckpt_path.parent.parent / "config.yaml")
+            exploration_cfg = OmegaConf.load(ckpt_path.parent.parent.parent / ".hydra" / "config.yaml")
+            exploration_cfg.pop("root_dir", None)
+            exploration_cfg.pop("run_name", None)
             exploration_cfg = dotdict(OmegaConf.to_container(exploration_cfg, resolve=True, throw_on_missing=True))
             if exploration_cfg.env.id != cfg.env.id:
                 raise ValueError(
@@ -107,7 +117,6 @@ def run_algorithm(cfg: Dict[str, Any]):
                     f"Got '{cfg.env.id}', but the environment used during exploration was {exploration_cfg.env.id}. "
                     "Set properly the environment for finetuning the experiment."
                 )
-            kwargs["exploration_cfg"] = exploration_cfg
             # Take environment configs from exploration
             cfg.env.frame_stack = exploration_cfg.env.frame_stack
             cfg.env.screen_size = exploration_cfg.env.screen_size
@@ -124,9 +133,9 @@ def run_algorithm(cfg: Dict[str, Any]):
                 cfg.env.sticky_jump = exploration_cfg.env.sticky_jump
                 cfg.env.sticky_attack = exploration_cfg.env.sticky_attack
                 cfg.env.break_speed_multiplier = exploration_cfg.env.break_speed_multiplier
-            if cfg.buffer.load_from_exploration:
-                cfg.fabric.devices = exploration_cfg.fabric.devices
-                cfg.fabric.num_nodes = exploration_cfg.fabric.num_nodes
+            kwargs["exploration_cfg"] = exploration_cfg
+            cfg.fabric = exploration_cfg.fabric
+            strategy = cfg.fabric.pop("strategy", "auto")
         fabric: Fabric = hydra.utils.instantiate(cfg.fabric, strategy=strategy, _convert_="all")
 
     if hasattr(cfg, "metric") and cfg.metric is not None:
@@ -144,22 +153,6 @@ def run_algorithm(cfg: Dict[str, Any]):
         for k in keys_to_remove:
             cfg.metric.aggregator.metrics.pop(k, None)
         MetricAggregator.disabled = cfg.metric.log_level == 0 or len(cfg.metric.aggregator.metrics) == 0
-
-    # Model Manager
-    if hasattr(cfg, "model_manager") and not cfg.model_manager.disabled and cfg.model_manager.models is not None:
-        predefined_models_keys = set()
-        if not hasattr(utils, "MODELS_TO_REGISTER"):
-            warnings.warn(
-                f"No 'MODELS_TO_REGISTER' set found for the {algo_name} algorithm under the {module} module. "
-                "No model will be registered.",
-                UserWarning,
-            )
-        else:
-            predefined_models_keys = utils.MODELS_TO_REGISTER
-        keys_to_remove = set(cfg.model_manager.models.keys()) - predefined_models_keys
-        for k in keys_to_remove:
-            cfg.model_manager.models.pop(k, None)
-        cfg.model_manager.disabled == cfg.model_manager.disabled or len(cfg.model_manager.models) == 0
     fabric.launch(command, cfg, **kwargs)
 
 
@@ -262,14 +255,6 @@ def check_configs(cfg: Dict[str, Any]):
                 "if you run into any problems.",
                 UserWarning,
             )
-    if not (_IS_MLFLOW_AVAILABLE or cfg.model_manager.disabled):
-        warnings.warn(
-            "MLFlow is not installed. "
-            "Please install it with 'pip install mlflow' if you want to use the MLFlow logger and log models. "
-            "Setting `cfg.model_manager.disabled=True`",
-            UserWarning,
-        )
-        cfg.model_manager.disabled = True
 
 
 def check_configs_evaluation(cfg: DictConfig):
@@ -281,9 +266,9 @@ def check_configs_evaluation(cfg: DictConfig):
 def run(cfg: DictConfig):
     """SheepRL zero-code command line utility."""
     print_config(cfg)
+    cfg = dotdict(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
     if cfg.checkpoint.resume_from:
         cfg = resume_from_checkpoint(cfg)
-    cfg = dotdict(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
     check_configs(cfg)
     run_algorithm(cfg)
 
@@ -292,9 +277,11 @@ def run(cfg: DictConfig):
 def evaluation(cfg: DictConfig):
     # Load the checkpoint configuration
     checkpoint_path = Path(cfg.checkpoint_path)
-    ckpt_cfg = OmegaConf.load(checkpoint_path.parent.parent / "config.yaml")
+    ckpt_cfg = OmegaConf.load(checkpoint_path.parent.parent.parent / ".hydra" / "config.yaml")
 
     # Merge the two configs
+    from omegaconf import open_dict
+
     with open_dict(cfg):
         capture_video = getattr(cfg.env, "capture_video", True)
         cfg.env = {"capture_video": capture_video, "num_envs": 1}
@@ -323,48 +310,3 @@ def evaluation(cfg: DictConfig):
     # Check the validity of the configuration and run the evaluation
     check_configs_evaluation(ckpt_cfg)
     eval_algorithm(ckpt_cfg)
-
-
-@hydra.main(version_base="1.3", config_path="configs", config_name="model_manager_config")
-def registration(cfg: DictConfig):
-    from sheeprl.utils.mlflow import register_model_from_checkpoint
-
-    checkpoint_path = Path(cfg.checkpoint_path)
-    ckpt_cfg = OmegaConf.load(checkpoint_path.parent.parent / "config.yaml")
-
-    # Merge the two configs
-    with open_dict(cfg):
-        cfg.env = ckpt_cfg.env
-        cfg.exp_name = ckpt_cfg.exp_name
-        cfg.algo = ckpt_cfg.algo
-        cfg.distribution = ckpt_cfg.distribution
-        cfg.seed = ckpt_cfg.seed
-
-    cfg = dotdict(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
-    cfg.to_log = dotdict(OmegaConf.to_container(ckpt_cfg, resolve=True, throw_on_missing=True))
-
-    precision = getattr(ckpt_cfg.fabric, "precision", None)
-    fabric = Fabric(devices=1, accelerator="cpu", num_nodes=1, precision=precision)
-
-    # Load the checkpoint
-    state = fabric.load(cfg.checkpoint_path)
-    # Retrieve the algorithm name, used to import the custom
-    # log_models_from_checkpoint function.
-    algo_name = cfg.algo.name
-    if "decoupled" in cfg.algo.name:
-        algo_name = algo_name.replace("_decoupled", "")
-    if algo_name.startswith("p2e_dv"):
-        algo_name = "_".join(algo_name.split("_")[:2])
-    try:
-        log_models_from_checkpoint = importlib.import_module(
-            f"sheeprl.algos.{algo_name}.utils"
-        ).log_models_from_checkpoint
-    except Exception as e:
-        print(e)
-        raise RuntimeError(
-            f"Make sure that the algorithm is defined in the `./sheeprl/algos/{algo_name}` folder "
-            "and that the `log_models_from_checkpoint` function is defined "
-            f"in the `./sheeprl/algos/{algo_name}/utils.py` file."
-        )
-
-    fabric.launch(register_model_from_checkpoint, cfg, state, log_models_from_checkpoint)

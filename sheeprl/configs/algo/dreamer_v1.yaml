@@ -11,16 +11,9 @@ horizon: 15
 name: dreamer_v1
 
 # Training recipe
-train_every: 1000
 learning_starts: 5000
 per_rank_gradient_steps: 100
-per_rank_sequence_length: ???
-
-# Encoder and decoder keys
-cnn_keys:
-  decoder: ${algo.cnn_keys.encoder}
-mlp_keys:
-  decoder: ${algo.mlp_keys.encoder}
+train_every: 1000
 
 # Model related parameters
 dense_units: 400

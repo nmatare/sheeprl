@@ -1,4 +1,2 @@
 size: ???
 memmap: True
-validate_args: False
-from_numpy: False

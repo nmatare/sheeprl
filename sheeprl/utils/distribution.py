@@ -7,7 +7,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.distributions import Bernoulli, Categorical, Distribution, constraints
+from torch.distributions import Categorical, Distribution, constraints
 from torch.distributions.kl import _kl_categorical_categorical, register_kl
 from torch.distributions.utils import broadcast_all
 
@@ -252,16 +252,12 @@ class TwoHotEncodingDistribution:
 
     def log_prob(self, x: Tensor) -> Tensor:
         x = self.transfwd(x)
-        # below in [-1, len(self.bins) - 1]
         below = (self.bins <= x).type(torch.int32).sum(dim=-1, keepdim=True) - 1
-        # above in [0, len(self.bins)]
-        above = below + 1
 
-        # above in [0, len(self.bins) - 1]
-        above = torch.minimum(above, torch.full_like(above, len(self.bins) - 1))
-        # below in [0, len(self.bins) - 1]
-        below = torch.maximum(below, torch.zeros_like(below))
+        above = len(self.bins) - (self.bins > x).type(torch.int32).sum(dim=-1, keepdim=True)
 
+        below = torch.clip(below, 0, len(self.bins) - 1)
+        above = torch.clip(above, 0, len(self.bins) - 1)
         equal = below == above
         dist_to_below = torch.where(equal, 1, torch.abs(self.bins[below] - x))
         dist_to_above = torch.where(equal, 1, torch.abs(self.bins[above] - x))
@@ -402,13 +398,3 @@ class OneHotCategoricalStraightThroughValidateArgs(OneHotCategoricalValidateArgs
 @register_kl(OneHotCategoricalValidateArgs, OneHotCategoricalValidateArgs)
 def _kl_onehotcategoricalvalidateargs_onehotcategoricalvalidateargs(p, q):
     return _kl_categorical_categorical(p._categorical, q._categorical)
-
-
-class BernoulliSafeMode(Bernoulli):
-    def __init__(self, probs=None, logits=None, validate_args=None):
-        super().__init__(probs, logits, validate_args)
-
-    @property
-    def mode(self):
-        mode = (self.probs > 0.5).to(self.probs)
-        return mode
